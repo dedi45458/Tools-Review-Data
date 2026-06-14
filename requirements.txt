@@ -1,0 +1,19 @@
+# Web Framework
+dash==2.14.2
+dash-bootstrap-components==1.5.0
+plotly==5.18.0
+
+# Database
+psycopg2-binary==2.9.9
+SQLAlchemy==2.0.23
+
+# Data Processing
+pandas==2.1.3
+numpy==1.26.2
+openpyxl==3.1.2
+
+# Environment & Config
+python-dotenv==1.0.0
+
+# Utilities
+gunicorn==21.2.0
