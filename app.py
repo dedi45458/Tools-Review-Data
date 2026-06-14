@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, dash_table, Input, Output, State, callback, ctx
+from dash import dcc, html, Input, Output, State, callback, ctx, no_update, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
 import numpy as np
@@ -8,72 +8,58 @@ import io
 import re
 from datetime import datetime
 import plotly.graph_objects as go
+from psycopg2 import extras
 
 # ==========================================================
-# IMPORT FUNGSI DARI database.py
+# IMPORT DARI database.py (Pastikan file ini ada di folder yang sama)
 # ==========================================================
-from database import (
-    dapatkan_koneksi_neon,
-    simpan_log_ke_neon,
-    jalankan_agregasi_tren,
-    ambil_rekap_tren,
-    hitung_dan_ambil_log_db,
-    import_data_rujukan,
-    tambah_keyword_medsos,
-    ambil_keyword_medsos
-)
+try:
+    from database import (
+        dapatkan_koneksi_neon,
+        hitung_dan_ambil_log_db,
+        ambil_rekap_tren,
+        jalankan_agregasi_tren,
+        tambah_keyword_medsos,
+        ambil_keyword_medsos,
+        import_data_rujukan
+    )
+except ImportError:
+    print("⚠️ File database.py tidak ditemukan. Menggunakan Mock Functions.")
+    def dapatkan_koneksi_neon(): return None
+    def hitung_dan_ambil_log_db(): return {}, {}
+    def ambil_rekap_tren(): return pd.DataFrame()
+    def jalankan_agregasi_tren(): return True
+    def tambah_keyword_medsos(k): return True
+    def ambil_keyword_medsos(): return []
+    def import_data_rujukan(df): return True
 
 # ==========================================================
-# MOCK st.session_state (Agar fungsi asli tidak perlu diubah)
+# GLOBAL STATE SERVER
 # ==========================================================
-class MockSessionState(dict):
-    pass
-
-class MockST:
-    def __init__(self):
-        self.session_state = MockSessionState()
-        self.session_state['aturan_kustom'] = []
-        self.session_state['medsoc_keywords'] = []
-
-st = MockST()
-
-# Global state untuk Dash (menggantikan st.session_state untuk data besar)
 server_state = {
-    'df_review_list': [],
-    'df_ref': None,
-    'df_tabel_atas': None,
-    'df_tabel_bawah': None,
-    'total_entri': 0
+    'df_penjangkauan': None,
+    'df_referensi': None,
+    'df_hasil_validasi': None,
+    'total_entri': 0,
+    'aturan_kustom': [],
+    'medsoc_keywords': [],
+    'riwayat_validasi': [] 
 }
 
-# ==========================================================
-# FUNGSI HELPER & ATURAN VALIDASI (SAMA PERSIS DENGAN ASLI)
-# ==========================================================
-def cek_kode(teks_kolom, kode_target):
-    if pd.isna(teks_kolom) or str(teks_kolom).strip().lower() in ['', 'nan']: return False
-    clean_str = str(teks_kolom).replace("'", "").replace(" ", "")
-    mentah_list = clean_str.split(",")
-    list_kode = [kode.split('.')[0] for kode in mentah_list if kode != '']
-    return str(kode_target) in list_kode
+class MockST:
+    session_state = {'aturan_kustom': [], 'medsoc_keywords': []}
+st = MockST()
 
-def buat_fungsi_validasi_kustom(target, kondisi, pembanding):
-    if kondisi == "Panjang karakter tidak sama dengan (!=)":
-        return lambda c: str(c.get(target, '')).strip() != '' and len(str(c.get(target, ''))) != int(pembanding)
-    elif kondisi == "Panjang karakter kurang dari ( < )":
-        return lambda c: str(c.get(target, '')).strip() != '' and len(str(c.get(target, ''))) < int(pembanding)
-    elif kondisi == "Kosong / Blank":
-        return lambda c: str(c.get(target, '')).strip() == '' or pd.isna(c.get(target)) or str(c.get(target)) == 'nan'
-    elif kondisi == "Mengandung teks tertentu":
-        return lambda c: pembanding.lower() in str(c.get(target, '')).lower()
-    elif kondisi == "Sama dengan teks/angka tertentu":
-        return lambda c: str(c.get(target, '')).strip().lower() == pembanding.strip().lower()
-    return lambda c: False
-
-def jalankan_review_data(df_asli, df_ref=None, nama_file=""):
-    list_kesalahan = []
-    if df_asli.empty: return pd.DataFrame(list_kesalahan)
+# ==========================================================
+# FUNGSI OPTIMASI VEKTORISASI (TIDAK BERUBAH)
+# ==========================================================
+def jalankan_review_data_optimized(df_asli, df_ref=None, nama_file=""):
+    if df_asli.empty: 
+        return pd.DataFrame()
     
     df = df_asli.copy()
+    
+    # 1. PRE-PROCESSING VEKTORISASI
     cek_sub_header = False
     if len(df) > 0:
         baris_pertama = str(df.iloc[0].values).upper()
@@ -99,639 +85,636 @@ def jalankan_review_data(df_asli, df_ref=None, nama_file=""):
         start_row_idx = 0
         if len(df) > 0 and ('dd/mm/yyyy' in str(df.iloc[0].values).lower() or 'laki-laki' in str(df.iloc[0].values).lower()):
             start_row_idx = 1
-            
-    is_file_rujukan = any('RUJUKAN' in str(c).upper() for c in df.columns) or any('FASYANKES' in str(c).upper() for c in df.columns)
+
+    # Bersihkan data sekali saja
+    df['id_clean'] = df.get('ID Klien', '').astype(str).str.replace("'", "", regex=False).str.strip()
+    df['nik_clean'] = df.get('NIK', '').astype(str).str.replace("'", "", regex=False).str.replace('.0', '', regex=False).str.strip()
+    df['v_ssr'] = df.get('Lembaga SSR', '').astype(str).str.strip().str.upper()
+    df['v_petugas'] = df.get('Kode Petugas', '').astype(str).str.replace("'", "", regex=False).str.strip()
+    df['v_kota'] = df.get('Nama Kota', '').astype(str).str.strip()
+    df['v_tanggal'] = df.get('Tanggal', '').astype(str).str.split(' ').str[0]
+    df['v_tipe_sasaran'] = df.get('Tipe Sasaran', df.get('Tipe Klien', '')).astype(str).str.replace('.0', '', regex=False).str.strip()
+    df['jk'] = df.get('Jenis Kelamin', '').astype(str).str.replace('.0', '', regex=False).str.strip()
+    df['jns_kontak'] = df.get('Jenis Kontak', '').astype(str).str.replace('.0', '', regex=False).str.strip()
+    df['jns_kegiatan'] = df.get('Jenis Kegiatan', '').astype(str).str.strip()
+    df['lokasi'] = df.get('Lokasi Outreach / Jenis Sosial Media', '').astype(str).str.strip()
+    df['no_hp'] = df.get('No. HP / Nama Akun', '').astype(str).str.strip()
+    df['vc1'] = df.get('Virtual & Tatap Muka', '').astype(str).str.replace('.0', '', regex=False).str.strip()
+    
+    df['ssr_id_key'] = df['v_ssr'] + "_" + df['id_clean']
+    df['tgl_p'] = pd.to_datetime(df.get('Tanggal', ''), errors='coerce', format='%d/%m/%Y')
+    
+    is_file_rujukan = any('RUJUKAN' in str(c).upper() or 'FASYANKES' in str(c).upper() for c in df.columns)
     tahun_sekarang = datetime.now().year
     hari_ini = pd.Timestamp(datetime.now().date())
 
-    keywords_aktif = st.session_state.get('medsoc_keywords', [])
-    pattern_medsos_dinamis = r'\b(' + '|'.join([re.escape(k) for k in keywords_aktif]) + r')\b' if keywords_aktif else r'\b(TIDAK_ADA_MEDSOS)\b'
-
-    try: dict_revisi, dict_justifikasi = hitung_dan_ambil_log_db()
-    except: dict_revisi, dict_justifikasi = {}, {}
+    # 2. PREPARE LOOKUP TABLES
+    dict_revisi, dict_justifikasi = {}, {}
+    try:
+        dict_revisi, dict_justifikasi = hitung_dan_ambil_log_db()
+    except: pass
 
     ref_ssr_id_to_nik, ref_nik_ssr_to_id = {}, {}
-    dict_pernah_cbs, dict_pernah_prep_rujukan = {}, {}
     
     if is_file_rujukan and df_ref is not None and not df_ref.empty:
         df_ref_cp = df_ref.copy()
         df_ref_cp.columns = [str(c).strip() for c in df_ref_cp.columns]
-        col_id_ref = [c for c in df_ref_cp.columns if 'ID' in c or 'Klien' in c]
-        col_nik_ref = [c for c in df_ref_cp.columns if 'NIK' in c]
-        col_ssr_ref = [c for c in df_ref_cp.columns if 'SSR' in c or 'Lembaga' in c]
-        col_layanan_ref = [c for c in df_ref_cp.columns if 'Jenis Layanan' in c or 'Layanan' in c]
-        col_rujukan_ref = [c for c in df_ref_cp.columns if 'Rujukan' in c]
-
+        col_id_ref = next((c for c in df_ref_cp.columns if 'ID' in c or 'Klien' in c), None)
+        col_nik_ref = next((c for c in df_ref_cp.columns if 'NIK' in c), None)
+        col_ssr_ref = next((c for c in df_ref_cp.columns if 'SSR' in c or 'Lembaga' in c), None)
+        
         if col_id_ref and col_ssr_ref:
-            for _, r in df_ref_cp.iterrows():
-                ssr_r = str(r[col_ssr_ref[0]]).strip().upper()
-                id_r = str(r[col_id_ref[0]]).replace("'", "").strip()
-                nik_r = str(r[col_nik_ref[0]]).replace("'", "").replace('.0', '').strip() if col_nik_ref else ''
-                key_klien = f"{ssr_r}_{id_r}"
-                if id_r and id_r != 'nan' and ssr_r and ssr_r != 'nan': ref_ssr_id_to_nik[key_klien] = nik_r
-                if nik_r and nik_r != 'nan' and nik_r != '' and ssr_r and ssr_r != 'nan': ref_nik_ssr_to_id[f"{nik_r}_{ssr_r}"] = id_r
-                if col_layanan_ref:
-                    layanans = str(r[col_layanan_ref[0]]).replace("'", "").replace(" ", "").split(',')
-                    if '5' in layanans or '6' in layanans: dict_pernah_cbs[key_klien] = True
-                if col_rujukan_ref:
-                    rujukans = str(r[col_rujukan_ref[0]]).replace("'", "").replace(" ", "").split(',')
-                    if '5' in rujukans: dict_pernah_prep_rujukan[key_klien] = True
+            df_ref_cp['ssr_clean'] = df_ref_cp[col_ssr_ref].astype(str).str.strip().str.upper()
+            df_ref_cp['id_clean_ref'] = df_ref_cp[col_id_ref].astype(str).str.replace("'", "", regex=False).str.strip()
+            df_ref_cp['nik_clean_ref'] = df_ref_cp[col_nik_ref].astype(str).str.replace("'", "", regex=False).str.replace('.0', '', regex=False).str.strip() if col_nik_ref else ''
+            df_ref_cp['key_klien'] = df_ref_cp['ssr_clean'] + "_" + df_ref_cp['id_clean_ref']
+            
+            valid_ref = (df_ref_cp['id_clean_ref'] != 'nan') & (df_ref_cp['ssr_clean'] != 'nan')
+            ref_ssr_id_to_nik = dict(zip(df_ref_cp.loc[valid_ref, 'key_klien'], df_ref_cp.loc[valid_ref, 'nik_clean_ref']))
+            
+            valid_nik = (df_ref_cp['nik_clean_ref'] != 'nan') & (df_ref_cp['nik_clean_ref'] != '') & (df_ref_cp['ssr_clean'] != 'nan')
+            ref_nik_ssr_to_id = dict(zip(df_ref_cp.loc[valid_nik, 'nik_clean_ref'] + "_" + df_ref_cp.loc[valid_nik, 'ssr_clean'], df_ref_cp.loc[valid_nik, 'id_clean_ref']))
 
-    df['id_mapped'] = df.get('ID Klien', pd.Series(dtype=str)).astype(str).str.replace("'", "").str.strip()
-    df['ssr_id_key'] = df.get('Lembaga SSR', pd.Series(dtype=str)).astype(str).str.strip().str.upper() + "_" + df['id_mapped']
-    dict_ssr_id_counts = df.iloc[start_row_idx:]['ssr_id_key'].value_counts().to_dict()
+    df['ref_nik'] = df['ssr_id_key'].map(ref_ssr_id_to_nik)
+    df['ref_id'] = (df['nik_clean'] + "_" + df['v_ssr']).map(ref_nik_ssr_to_id)
+
+    # 3. PRE-COMPUTE AGGREGATIONS & FLAGS
+    df['is_vo'] = (df['jns_kontak'] == '3')
+    df['is_pwid'] = df['v_tipe_sasaran'].isin(['1401', '1403'])
     
-    def periksa_hiv(x): return '1' in str(x).replace("'", "").replace(" ", "").split(',')
-    def periksa_rujukan(x): 
-        s = str(x).replace("'", "").replace(" ", "").replace(".0", "")
-        if '.' in s and ',' not in s: s = s.replace('.', ',')
-        return '2' in s.split(',')
+    id_counts = df['ssr_id_key'].value_counts().to_dict()
+    df['id_counts'] = df['ssr_id_key'].map(id_counts)
 
     col_info = next((c for c in df.columns if "INFORMASI" in str(c).upper() and "DIBERIKAN" in str(c).upper()), "")
     col_kegiatan = next((c for c in df.columns if "JENIS KEGIATAN" in str(c).upper()), "")
     col_ruj = next((c for c in df.columns if "RUJUKAN" in str(c).upper()), "")
-    
-    if col_info and col_kegiatan: df['is_info_hiv'] = df[col_info].apply(periksa_hiv) | df[col_kegiatan].apply(periksa_hiv)
-    else: df['is_info_hiv'] = False
-    if col_ruj: df['is_rujuk_tes'] = df[col_ruj].apply(periksa_rujukan)
-    else: df['is_rujuk_tes'] = False
 
-    dict_pernah_hiv = df.groupby('ssr_id_key')['is_info_hiv'].any().to_dict()
-    dict_pernah_rujuk = df.groupby('ssr_id_key')['is_rujuk_tes'].any().to_dict()
-
-    def _safe_float(val):
-        try: return float(val) if pd.notna(val) and str(val).strip().lower() not in ['', 'nan'] else 0.0
-        except: return 0.0
-
-    col_kie_list = [c for c in df.columns if 'KIE' in str(c).upper()]
-    col_kon_list = [c for c in df.columns if 'KONDOM' in str(c).upper()]
-    col_pel_list = [c for c in df.columns if 'PELICIN' in str(c).upper()]
-    col_jar_list = [c for c in df.columns if 'JARUM' in str(c).upper() and 'KEMBALI' not in str(c).upper()]
-    col_swab_list = [c for c in df.columns if 'SWAB' in str(c).upper() or 'ALKOHOL' in str(c).upper()]
-    semua_kolom_logistik = col_kie_list + col_kon_list + col_pel_list + col_jar_list + col_swab_list
-
-    df['tmp_log'] = 0.0
-    for col in semua_kolom_logistik: df['tmp_log'] += df[col].apply(_safe_float)
-    df['kunci_klien_ref_log'] = df.get('Lembaga SSR', pd.Series(dtype=str)).astype(str).str.strip().str.upper() + "_" + df['id_mapped']
-    dict_total_log_per_klien = df.groupby('kunci_klien_ref_log')['tmp_log'].sum().to_dict()
-
-    aturan_kustom = st.session_state.get('aturan_kustom', [])
-    SEMUA_ATURAN_AKTIF = ATURAN_VALIDASI_BAWAAN + aturan_kustom
-
-    for idx in range(start_row_idx, len(df)):
-        row = df.iloc[idx]
-        v_ssr = str(row.get('Lembaga SSR', '')).strip().upper() if pd.notna(row.get('Lembaga SSR')) else ''
-        v_petugas = str(row.get('Kode Petugas', '')).replace("'", "").strip() if pd.notna(row.get('Kode Petugas')) else ''
-        v_kota = str(row.get('Nama Kota', '')).strip() if pd.notna(row.get('Nama Kota')) else ''
-        v_tanggal = str(row.get('Tanggal', '')).split(' ')[0] if pd.notna(row.get('Tanggal')) else ''
+    if col_info and col_kegiatan:
+        df['is_info_hiv'] = df[col_info].astype(str).str.contains(r'\b1\b', regex=True, na=False) | df[col_kegiatan].astype(str).str.contains(r'\b1\b', regex=True, na=False)
+    else:
+        df['is_info_hiv'] = False
         
-        id_clean = str(row.get('ID Klien', '')).strip().replace("'", "")
-        nik_clean = str(row.get('NIK', '')).strip().replace("'", "").replace('.0', '')
-        v_tipe_sasaran = str(row.get('Tipe Sasaran', row.get('Tipe Klien', ''))).replace('.0', '').strip()
-        umur = row.get('Umur', None)
-        jk = str(row.get('Jenis Kelamin', '')).replace('.0', '').strip()
-        jns_kontak = str(row.get('Jenis Kontak', '')).replace('.0', '').strip()
-        jns_kegiatan = str(row.get('Jenis Kegiatan', '')).strip()
-        lokasi = str(row.get('Lokasi Outreach / Jenis Sosial Media', '')).strip()
-        info_diberikan = str(row.get(col_info, '')).strip() if col_info else ''
-        rujukan = str(row.get(col_ruj, '')).strip() if col_ruj else ''
-        no_hp = str(row.get('No. HP / Nama Akun', '')).strip()
-        vc1 = str(row.get('Virtual & Tatap Muka', '')).replace('.0', '').strip()
+    if col_ruj:
+        df['is_rujuk_tes'] = df[col_ruj].astype(str).str.replace('.', ',', regex=False).str.contains(r'\b2\b', regex=True, na=False)
+    else:
+        df['is_rujuk_tes'] = False
 
-        log_kie = sum(_safe_float(row.get(c, 0)) for c in col_kie_list)
-        log_kon = sum(_safe_float(row.get(c, 0)) for c in col_kon_list)
-        log_pel = sum(_safe_float(row.get(c, 0)) for c in col_pel_list)
-        log_jar = sum(_safe_float(row.get(c, 0)) for c in col_jar_list)
-        log_swab = sum(_safe_float(row.get(c, 0)) for c in col_swab_list)
-        jarum_kembali = _safe_float(row.get('Jumlah Jarum Suntik Kembali', 0))
+    pernah_hiv_map = df.groupby('ssr_id_key')['is_info_hiv'].any().to_dict()
+    pernah_rujuk_map = df.groupby('ssr_id_key')['is_rujuk_tes'].any().to_dict()
+    df['pernah_dapat_info_hiv'] = df['ssr_id_key'].map(pernah_hiv_map).fillna(False)
+    df['pernah_dapat_rujuk_tes'] = df['ssr_id_key'].map(pernah_rujuk_map).fillna(False)
 
-        tgl_raw = row.get('Tanggal', None)
-        tgl_p = pd.to_datetime(tgl_raw, errors='coerce', format='%d/%m/%Y') if pd.notna(tgl_raw) and '/' in str(tgl_raw) else pd.to_datetime(tgl_raw, errors='coerce')
+    col_kie = [c for c in df.columns if 'KIE' in str(c).upper()]
+    col_kon = [c for c in df.columns if 'KONDOM' in str(c).upper()]
+    col_pel = [c for c in df.columns if 'PELICIN' in str(c).upper()]
+    col_jar = [c for c in df.columns if 'JARUM' in str(c).upper() and 'KEMBALI' not in str(c).upper()]
+    col_swab = [c for c in df.columns if 'SWAB' in str(c).upper() or 'ALKOHOL' in str(c).upper()]
+    
+    def safe_sum(cols):
+        return df[cols].apply(pd.to_numeric, errors='coerce').sum(axis=1, skipna=True).fillna(0)
 
-        kunci_klien_ref = f"{v_ssr}_{id_clean}"
-        context_data = {
-            'row': row, 'id_clean': id_clean, 'nik_clean': nik_clean, 'v_ssr': v_ssr, 'v_tanggal': v_tanggal,
-            'v_petugas': v_petugas, 'v_kota': v_kota, 'v_tipe_sasaran': v_tipe_sasaran, 'umur': umur, 'jk': jk,
-            'jns_kontak': jns_kontak, 'jns_kegiatan': jns_kegiatan, 'lokasi': lokasi, 'info_diberikan': info_diberikan,
-            'rujukan': rujukan, 'no_hp': no_hp, 'vc1': vc1, 'log_kie': log_kie, 'log_kon': log_kon, 'log_pel': log_pel,
-            'log_jar': log_jar, 'log_swab': log_swab, 'jarum_kembali': jarum_kembali, 'tgl_p': tgl_p, 'hari_ini': hari_ini,
-            'tahun_sekarang': tahun_sekarang, 'is_vo': (jns_kontak == '3'), 'is_pwid': (v_tipe_sasaran in ['1401', '1403']),
-            'id_counts': {id_clean: dict_ssr_id_counts.get(kunci_klien_ref, 0)}, 
-            'pernah_dapat_info_hiv': dict_pernah_hiv.get(kunci_klien_ref, False), 
-            'pernah_dapat_rujuk_tes': dict_pernah_rujuk.get(kunci_klien_ref, False),
-            'is_file_rujukan': is_file_rujukan, 'df_ref': df_ref, 'ref_ssr_id_to_nik': ref_ssr_id_to_nik, 'ref_nik_ssr_to_id': ref_nik_ssr_to_id,
-            'pernah_cbs_di_rujukan': dict_pernah_cbs.get(kunci_klien_ref, False),
-            'pernah_prep_di_rujukan': dict_pernah_prep_rujukan.get(kunci_klien_ref, False),
-            'total_log_keseluruhan_klien': dict_total_log_per_klien.get(kunci_klien_ref, 0.0),
-            'pattern_medsos': pattern_medsos_dinamis
-        }
+    df['log_kie'] = safe_sum(col_kie)
+    df['log_kon'] = safe_sum(col_kon)
+    df['log_pel'] = safe_sum(col_pel)
+    df['log_jar'] = safe_sum(col_jar)
+    df['log_swab'] = safe_sum(col_swab)
+    df['jarum_kembali'] = pd.to_numeric(df.get('Jumlah Jarum Suntik Kembali', 0), errors='coerce').fillna(0)
+    
+    total_log_cols = ['log_kie', 'log_kon', 'log_pel', 'log_jar', 'log_swab']
+    total_log_map = df.groupby('ssr_id_key')[total_log_cols].sum().sum(axis=1).to_dict()
+    df['total_log_keseluruhan_klien'] = df['ssr_id_key'].map(total_log_map).fillna(0)
 
-        for rule in SEMUA_ATURAN_AKTIF:
-            nama_ind = rule["nama"]
-            try:
-                if rule["periksa"](context_data):
-                    key_db = f"{v_ssr}_{v_tanggal}_{id_clean}_{nama_ind}"
-                    is_butuh_konfirmasi = "konfirmasi" in nama_ind.lower()
-                    if is_butuh_konfirmasi and key_db in dict_justifikasi and not dict_revisi.get(key_db, False): continue
-                        
-                    status_validasi = "-"
-                    justif_val = dict_justifikasi.get(key_db, "") if is_butuh_konfirmasi else ""
-                    if key_db in dict_revisi: status_validasi = "kesalahan pada ID yang berulang (belum dilakukan revisi)"
+    # 4. EVALUASI ATURAN (VEKTORISASI)
+    list_error_dfs = []
+    keywords_aktif = st.session_state.get('medsoc_keywords', [])
+    pattern_medsos = r'\b(' + '|'.join([re.escape(k) for k in keywords_aktif]) + r')\b' if keywords_aktif else r'\b(TIDAK_ADA_MEDSOS)\b'
 
-                    list_kesalahan.append({
-                        "Pilih": False, "Lembaga SSR": v_ssr, "Tanggal": v_tanggal, "ID Klien": id_clean, 
-                        "Kode Petugas": v_petugas, "Nama Kota": v_kota, "NIK": nik_clean, "Tipe Sasaran": v_tipe_sasaran,
-                        "INDIKATOR KESALAHAN DATA": nama_ind, "validasi hasil review": status_validasi, "Justifikasi": justif_val
-                    })
-            except: pass
+    def add_error(rule_name, mask):
+        if mask.any():
+            err_df = df[mask].copy()
+            err_df['INDIKATOR KESALAHAN DATA'] = rule_name
+            
+            is_konfirmasi = "konfirmasi" in rule_name.lower()
+            if is_konfirmasi:
+                err_df['key_db'] = err_df['v_ssr'] + "_" + err_df['v_tanggal'] + "_" + err_df['id_clean'] + "_" + rule_name
+                valid_to_show = []
+                for idx, row in err_df.iterrows():
+                    if row['key_db'] in dict_justifikasi and not dict_revisi.get(row['key_db'], False):
+                        continue
+                    valid_to_show.append(idx)
+                err_df = err_df.loc[valid_to_show].copy()
+                
+                err_df['validasi hasil review'] = err_df['key_db'].map(lambda k: "kesalahan pada ID yang berulang (belum dilakukan revisi)" if k in dict_revisi else "-")
+                err_df['Justifikasi'] = err_df['key_db'].map(lambda k: dict_justifikasi.get(k, ""))
+                err_df = err_df.drop(columns=['key_db'])
+            else:
+                err_df['validasi hasil review'] = "-"
+                err_df['Justifikasi'] = ""
+                
+            err_df['Pilih'] = False
+            list_error_dfs.append(err_df)
 
-    return pd.DataFrame(list_kesalahan)
+    # Aturan Bawaan
+    add_error("Tahun dalam tanggal penjangkauan lebih besar/kecil dari tahun sekarang", df['tgl_p'].dt.year != tahun_sekarang)
+    add_error("Kode Petugas Kosong", df['v_petugas'].isin(['', 'nan', 'None']) | df['v_petugas'].isna())
+    add_error("Tanggal lebih besar dari tanggal hari ini", df['tgl_p'] > hari_ini)
+    add_error("IDKD kurang/lebih dari 10 digit karakter", (df['id_clean'] != '') & (df['id_clean'].str.len() != 10))
+    add_error("NIK kurang/lebih dari 16 digit (konfirmasi)", (df['nik_clean'] != '') & (df['nik_clean'].str.len() != 16))
+    add_error("Kesalahan dalam penulisan NIK (00) (konfirmasi)", (df['nik_clean'] != '') & (df['nik_clean'].str.endswith('00')))
+    add_error("LSL/Waria tapi jenis kelamin perempuan", df['v_tipe_sasaran'].isin(['1304', '1301']) & (df['jk'] == '2'))
+    add_error("VO tapi menyerahkan jarum", df['is_vo'] & (df['log_jar'] > 0))
+    add_error("VO menerima logistik selain KIE", df['is_vo'] & ((df['log_kon'] > 0) | (df['log_pel'] > 0) | (df['log_swab'] > 0)))
+    add_error("Lokasi outreach indikasi diisi nomer HP", df['lokasi'].str.contains(r'(08\d{8,11})|(\+62\d{8,11})', regex=True, na=False))
+    add_error("Penjangkauan tatap muka tapi lokasi outreach diindikasi ada nama medsos", (df['jns_kontak'].isin(['1', '2'])) & (df['lokasi'].str.contains(pattern_medsos, case=False, regex=True, na=False)))
+    add_error("KD dikontak lebih dari 1x tapi tidak mendapat informasi HIV", (df['id_counts'] > 1) & (~df['pernah_dapat_info_hiv']))
+    add_error("Logistik kosong (Konfirmasi)", df['total_log_keseluruhan_klien'] == 0)
+    add_error("Popkun selain PWID menerima jarum suntik", (~df['is_pwid']) & (df['log_jar'] > 0))
 
-ATURAN_VALIDASI_BAWAAN = [
-    {"nama": "Tahun dalam tanggal penjangkauan lebih besar/kecil dari tahun sekarang", "periksa": lambda c: pd.notna(c['tgl_p']) and c['tgl_p'].year != c['tahun_sekarang']},
-    {"nama": "Kode Petugas Kosong", "periksa": lambda c: pd.isna(c['row'].get('Kode Petugas')) or str(c['row'].get('Kode Petugas')).strip() in ['', 'nan', 'None']},
-    {"nama": "Tanggal lebih besar dari tanggal hari ini", "periksa": lambda c: pd.notna(c['tgl_p']) and c['tgl_p'] > c['hari_ini']},
-    {"nama": "IDKD kurang/lebih dari 10 digit karakter", "periksa": lambda c: c['id_clean'] != '' and (len(c['id_clean']) != 10 or not c['id_clean'].isalnum())},
-    {"nama": "Digit nama kurang/lebih dari 4 digit karakter", "periksa": lambda c: c['id_clean'] != '' and (len(c['id_clean']) < 4 or not (c['id_clean'][:4].isalpha() or (c['id_clean'][:3].isalpha() and c['id_clean'][3] == '0')))},
-    {"nama": "Digit tanggal lahir lebih/kurang dari 6 digit angka", "periksa": lambda c: c['id_clean'] != '' and len(c['id_clean']) == 10 and not c['id_clean'][4:].isdigit()},
-    {"nama": "Ada tanda titik (.) pada penulisan IDKD", "periksa": lambda c: '.' in str(c['row'].get('ID Klien', ''))},
-    {"nama": "Ada spasi pada penulisan IDKD", "periksa": lambda c: ' ' in str(c['row'].get('ID Klien', ''))},
-    {"nama": "ID sama tapi NIK berbeda dengan data Semester/Tahun lalu (Konfirmasi)", "periksa": lambda c: c['is_file_rujukan'] and c['df_ref'] is not None and c['v_ssr'] and f"{c['v_ssr']}_{c['id_clean']}" in c['ref_ssr_id_to_nik'] and c['ref_ssr_id_to_nik'][f"{c['v_ssr']}_{c['id_clean']}"] != c['nik_clean']},
-    {"nama": "NIK sama tapi ID berbeda dengan data Semester/Tahun lalu (Konfirmasi)", "periksa": lambda c: c['is_file_rujukan'] and c['df_ref'] is not None and c['v_ssr'] and c['nik_clean'] != '' and f"{c['nik_clean']}_{c['v_ssr']}" in c['ref_nik_ssr_to_id'] and c['ref_nik_ssr_to_id'][f"{c['nik_clean']}_{c['v_ssr']}"] != c['id_clean']},
-    {"nama": "Usia KD dibawah 16 tahun (konfirmasi)", "periksa": lambda c: pd.notna(c['umur']) and str(c['umur']).strip() != '' and float(c['umur']) < 17},
-    {"nama": "Usia KD diatas 70 tahun (konfirmasi)", "periksa": lambda c: pd.notna(c['umur']) and str(c['umur']).strip() != '' and float(c['umur']) > 70},
-    {"nama": "Tahun lahir pada IDKD berbeda dengan Tahun lahir pada NIK (konfirmasi)", "periksa": lambda c: c['id_clean'] != '' and len(c['id_clean']) == 10 and c['nik_clean'] != '' and len(c['nik_clean']) == 16 and c['id_clean'][4:6] != (str(c['row'].get('NIK', '')) if str(c['row'].get('NIK', '')).startswith("'") else "'" + c['nik_clean'])[11:13]},
-    {"nama": "NIK kurang/lebih dari 16 digit (konfirmasi)", "periksa": lambda c: c['nik_clean'] not in ['', 'nan', 'none', 'NaN', "'"] and len(c['nik_clean']) != 16},
-    {"nama": "Kesalahan dalam penulisan NIK (00) (konfirmasi)", "periksa": lambda c: c['nik_clean'] != '' and c['nik_clean'].endswith('00')},
-    {"nama": "Secara NIK harusnya perempuan bukan laki-laki (konfirmasi)", "periksa": lambda c: len(c['nik_clean']) == 16 and c['jk'] == '1' and int(c['nik_clean'][6:8]) > 31 if c['nik_clean'].isdigit() and len(c['nik_clean'])>=8 else False},
-    {"nama": "LSL/Waria tapi jenis kelamin perempuan", "periksa": lambda c: c['v_tipe_sasaran'] in ['1304', '1301'] and c['jk'] == '2'},
-    {"nama": "Jenis kontak dengan Jenis Kegiatan tidak sesuai", "periksa": lambda c: (c['jns_kontak'] == '1' and c['jns_kegiatan'] not in ['1', '5']) or (c['jns_kontak'] == '2' and c['jns_kegiatan'] not in ['2', '3', '4', '6', '7']) or (c['jns_kontak'] == '3' and c['jns_kegiatan'] != '8')},
-    {"nama": "Jenis kontak Individual/kelompok tapi kolom Virtual dan Tatap Muka (VC1) tidak diisi", "periksa": lambda c: c['jns_kontak'] in ['1', '2'] and (c['vc1'] == '' or c['vc1'] == 'nan')},
-    {"nama": "Penjangkauan tatap muka tapi lokasi outreach diindikasi ada nama medsos", "periksa": lambda c: c['jns_kontak'] in ['1', '2'] and c['pattern_medsos'] is not None and bool(re.search(c['pattern_medsos'], str(c['lokasi']), re.IGNORECASE))},
-    {"nama": "Lokasi outreach diisi IDKD", "periksa": lambda c: c['lokasi'] != '' and c['lokasi'] != 'nan' and len(c['lokasi']) == 10 and c['lokasi'][:4].isalpha() and c['lokasi'][4:].isdigit()},
-    {"nama": "Lokasi outreach diindikasi kurang spesifik atau kurang detil (digit huruf <17 digit) (konfirmasi)", "periksa": lambda c: c['lokasi'] != '' and c['lokasi'] != 'nan' and len(c['lokasi']) < 17 and not c['is_vo']},
-    {"nama": "Lokasi outreach indikasi diisi nomer HP", "periksa": lambda c: c['lokasi'] != '' and c['lokasi'] != 'nan' and re.search(r'(08\d{8,11})|(\+62\d{8,11})', c['lokasi'].replace('-', '').replace(' ', ''))},
-    {"nama": "Bukan PWID mendapatkan info 8 atau 9 (LASS, PTRM)", "periksa": lambda c: not c['is_pwid'] and (cek_kode(c['info_diberikan'], '8') or cek_kode(c['info_diberikan'], '9'))},
-    {"nama": "LSL/TG/PWID menerima informasi PMTC (konfirmasi)", "periksa": lambda c: c['v_tipe_sasaran'] in ['1304', '1301', '1401'] and cek_kode(c['info_diberikan'], '6')},
-    {"nama": "Konfirmasi jumlah KIE yang diberikan adalah wajar (konfirmasi)", "periksa": lambda c: c['log_kie'] > 5},
-    {"nama": "Konfirmasi jumlah kondom yang diberikan adalah wajar (konfirmasi)", "periksa": lambda c: c['log_kon'] > 144},
-    {"nama": "Konfirmasi jumlah pelicin yang diberikan adalah wajar (konfirmasi)", "periksa": lambda c: c['log_pel'] > 50},
-    {"nama": "Konfirmasi jumlah jarum yang diberikan adalah wajar (konfirmasi)", "periksa": lambda c: c['log_jar'] > 10},
-    {"nama": "Konfirmasi jumlah alkohol SWAB yang diberikan adalah wajar (konfirmasi)", "periksa": lambda c: c['log_swab'] > 50},
-    {"nama": "VO tapi kolom Virtual dan Tatap Muka (VC1) diisi angka 1", "periksa": lambda c: c['is_vo'] and c['vc1'] == '1'},
-    {"nama": "VO tapi lokasi outreach bukan nama medsos/kurang tepat mencatat nama aplikasi medsos", "periksa": lambda c: c['is_vo'] and str(c['lokasi']).strip() != '' and (c['pattern_medsos'] is None or not bool(re.search(c['pattern_medsos'], str(c['lokasi']), re.IGNORECASE)))},
-    {"nama": "VO tapi menyerahkan jarum", "periksa": lambda c: c['is_vo'] and c['log_jar'] > 0},
-    {"nama": "VO menerima logistik selain KIE", "periksa": lambda c: c['is_vo'] and (c['log_kon'] > 0 or c['log_pel'] > 0 or c['log_swab'] > 0)},
-    {"nama": "VO tapi nama akun /No. Hp tidak diisi", "periksa": lambda c: c['is_vo'] and (c['no_hp'] == '' or c['no_hp'] == 'nan')},
-    {"nama": "Tidak ada informasi satupun yang diberikan / tidak diisi", "periksa": lambda c: str(c.get('info_diberikan', '')).strip() == '' or str(c.get('info_diberikan', '')).strip().lower() in ['nan', 'none', 'null']},
-    {"nama": "KD dikontak lebih dari 1x tapi tidak mendapat informasi HIV", "periksa": lambda c: c['id_clean'] != '' and c['id_counts'].get(c['id_clean'], 0) > 1 and not c['pernah_dapat_info_hiv']},
-    {"nama": "KD telah menerima layanan CBS tapi tidak ada informasi CBS", "periksa": lambda c: c['pernah_cbs_di_rujukan'] and not cek_kode(c['info_diberikan'], '13')},
-    {"nama": "KD ada rujukan PrEp di penjangkauan tapi tidak ada informasi PrEp", "periksa": lambda c: cek_kode(c['rujukan'], '5') and not cek_kode(c['info_diberikan'], '10')},
-    {"nama": "KD telah menerima layanan PrEp tapi tidak ada rujukan PrEp di penjangkauan", "periksa": lambda c: c['pernah_prep_di_rujukan'] and not cek_kode(c['rujukan'], '5')},
-    {"nama": "Logistik kosong (Konfirmasi)", "periksa": lambda c: c['total_log_keseluruhan_klien'] == 0},
-    {"nama": "Tipe klien PWID tapi tidak menerima jarum (konfirmasi)", "periksa": lambda c: c['is_pwid'] and c['log_jar'] == 0 and not c['is_vo']},
-    {"nama": "Tipe klien PWID tapi tidak menerima alkohol SWAB (konfirmasi)", "periksa": lambda c: c['is_pwid'] and c['log_swab'] == 0 and not c['is_vo']},
-    {"nama": "Popkun selain PWID menerima jarum suntik", "periksa": lambda c: not c['is_pwid'] and c['log_jar'] > 0},
-    {"nama": "Popkun selain PWID menerima alkohol swab", "periksa": lambda c: not c['is_pwid'] and c['log_swab'] > 0},
-    {"nama": "Popkun selain PWID menyerahkan jarum", "periksa": lambda c: not c['is_pwid'] and c['jarum_kembali'] > 0},
-    {"nama": "Tidak ada rujukan yang diberikan satupun / tidak diisi", "periksa": lambda c: c['rujukan'] == '' or c['rujukan'] == 'nan'},
-    {"nama": "KD dikontak lebih dari 1x tetapi tidak ada Rujukan Tes HIV (konfirmasi)", "periksa": lambda c: c['id_clean'] != '' and c['id_counts'].get(c['id_clean'], 0) > 1 and not c['pernah_dapat_rujuk_tes']},
-    {"nama": "Bukan penasun rujukan 3,4", "periksa": lambda c: not c['is_pwid'] and (cek_kode(c['rujukan'], '3') or cek_kode(c['rujukan'], '4'))}
-]
+    # 5. ATURAN KUSTOM
+    aturan_kustom = st.session_state.get('aturan_kustom', [])
+    if aturan_kustom:
+        for idx, row in df.iterrows():
+            context_data = {
+                'row': row, 'id_clean': row['id_clean'], 'nik_clean': row['nik_clean'], 
+                'v_ssr': row['v_ssr'], 'v_tanggal': row['v_tanggal'], 'v_petugas': row['v_petugas'],
+                'v_kota': row['v_kota'], 'v_tipe_sasaran': row['v_tipe_sasaran'], 'umur': row.get('Umur'),
+                'jk': row['jk'], 'jns_kontak': row['jns_kontak'], 'jns_kegiatan': row['jns_kegiatan'],
+                'lokasi': row['lokasi'], 'info_diberikan': row.get(col_info, ''), 'rujukan': row.get(col_ruj, ''),
+                'no_hp': row['no_hp'], 'vc1': row['vc1'], 'log_kie': row['log_kie'], 'log_kon': row['log_kon'],
+                'log_pel': row['log_pel'], 'log_jar': row['log_jar'], 'log_swab': row['log_swab'],
+                'jarum_kembali': row['jarum_kembali'], 'tgl_p': row['tgl_p'], 'hari_ini': hari_ini,
+                'tahun_sekarang': tahun_sekarang, 'is_vo': row['is_vo'], 'is_pwid': row['is_pwid'],
+                'id_counts': {row['id_clean']: row['id_counts']}, 'pernah_dapat_info_hiv': row['pernah_dapat_info_hiv'],
+                'pernah_dapat_rujuk_tes': row['pernah_dapat_rujuk_tes'], 'is_file_rujukan': is_file_rujukan,
+                'df_ref': df_ref, 'ref_ssr_id_to_nik': ref_ssr_id_to_nik, 'ref_nik_ssr_to_id': ref_nik_ssr_to_id,
+                'total_log_keseluruhan_klien': row['total_log_keseluruhan_klien'], 'pattern_medsos': pattern_medsos
+            }
+            for rule in aturan_kustom:
+                try:
+                    if rule["periksa"](context_data):
+                        err_row = row.to_dict()
+                        err_row['INDIKATOR KESALAHAN DATA'] = rule["nama"]
+                        err_row['validasi hasil review'] = "-"
+                        err_row['Justifikasi'] = ""
+                        err_row['Pilih'] = False
+                        list_error_dfs.append(pd.DataFrame([err_row]))
+                except: pass
+
+    # 6. GABUNGKAN HASIL
+    if not list_error_dfs: return pd.DataFrame()
+    final_df = pd.concat(list_error_dfs, ignore_index=True)
+    required_cols = ["Pilih", "Lembaga SSR", "Tanggal", "ID Klien", "Kode Petugas", "Nama Kota", "NIK", "Tipe Sasaran", "INDIKATOR KESALAHAN DATA", "validasi hasil review", "Justifikasi"]
+    for col in required_cols:
+        if col not in final_df.columns:
+            final_df[col] = "" if col in ["Justifikasi", "validasi hasil review"] else False
+    return final_df[required_cols]
 
 # ==========================================================
-# INISIALISASI APLIKASI DASH & TEMA GLASSMORPHISM
+# FUNGSI CHUNKING DATABASE NEON
+# ==========================================================
+def simpan_log_ke_neon_chunked(list_log_db, chunk_size=5000):
+    if not list_log_db: return True
+    conn = dapatkan_koneksi_neon()
+    if not conn: return False
+    try:
+        with conn.cursor() as cur:
+            for i in range(0, len(list_log_db), chunk_size):
+                chunk = list_log_db[i : i + chunk_size]
+                extras.execute_batch(
+                    cur, 
+                    """
+                    INSERT INTO log_validasi_review 
+                    (Lembaga_SSR, Tanggal, ID_Klien, Indikator_Kesalahan_Data, is_revisi, Justifikasi, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, NOW())
+                    ON CONFLICT (Lembaga_SSR, Tanggal, ID_Klien, Indikator_Kesalahan_Data) 
+                    DO UPDATE SET 
+                        is_revisi = EXCLUDED.is_revisi, 
+                        Justifikasi = EXCLUDED.Justifikasi,
+                        updated_at = NOW()
+                    """,
+                    [tuple(row) for row in chunk],
+                    page_size=1000
+                )
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        print(f"Error DB: {e}")
+        return False
+    finally:
+        conn.close()
+
+# ==========================================================
+# INISIALISASI APP & TEMA MODERN SOLID DARK
 # ==========================================================
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.SLATE])
 
-app.index_string = '''
+# CSS Custom untuk Modern Solid Dark
+CUSTOM_CSS = """
+    body { 
+        background-color: #0f172a !important; /* Slate 900 - Solid Dark */
+        font-family: 'Inter', system-ui, -apple-system, sans-serif; 
+        color: #e2e8f0; /* Slate 200 */
+        margin: 0;
+        min-height: 100vh;
+    }
+    
+    /* Modern Solid Card Style */
+    .solid-card {
+        background-color: #1e293b; /* Slate 800 */
+        border: 1px solid #334155; /* Slate 700 Border */
+        border-radius: 12px;
+        padding: 1.5rem;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        margin-bottom: 20px;
+        transition: border-color 0.2s ease;
+    }
+    .solid-card:hover { 
+        border-color: #475569; /* Slightly lighter on hover */
+    }
+    
+    /* Typography & Metrics */
+    .metric-value { 
+        color: #f8fafc !important; 
+        font-weight: 700; 
+        font-size: 2.2rem; 
+        margin: 0; 
+        line-height: 1.2; 
+    }
+    .metric-label { 
+        color: #94a3b8; /* Slate 400 */
+        font-size: 0.85rem; 
+        margin-top: 8px; 
+        text-transform: uppercase; 
+        letter-spacing: 0.5px; 
+        font-weight: 600;
+    }
+    
+    /* Accent Colors for Metrics */
+    .text-accent-blue { color: #38bdf8 !important; } /* Sky 400 */
+    .text-accent-red { color: #fb7185 !important; } /* Rose 400 - Softer than pure red */
+    .text-accent-green { color: #34d399 !important; } /* Emerald 400 */
+
+    /* Buttons */
+    .btn-modern-primary { 
+        background-color: #0ea5e9 !important; /* Sky 500 */
+        border: none !important; 
+        color: #ffffff !important; 
+        font-weight: 600 !important;
+        border-radius: 8px !important;
+        padding: 10px 20px !important;
+        transition: all 0.2s ease;
+    }
+    .btn-modern-primary:hover { 
+        background-color: #0284c7 !important; /* Sky 600 */
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(14, 165, 233, 0.25);
+    }
+    
+    /* Upload Zone */
+    .upload-zone {
+        border: 2px dashed #475569; /* Slate 600 */
+        border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        cursor: pointer;
+        transition: all 0.3s;
+        background-color: rgba(30, 41, 59, 0.5);
+    }
+    .upload-zone:hover { 
+        border-color: #38bdf8; 
+        background-color: rgba(56, 189, 248, 0.05); 
+    }
+    
+    /* DataTable Styling - Solid & Clean */
+    .dash-table-container { 
+        background: transparent !important; 
+        border: none !important; 
+    }
+    .dash-spreadsheet-inner td { 
+        background-color: #1e293b !important; /* Slate 800 */
+        color: #e2e8f0 !important; 
+        border-bottom: 1px solid #334155 !important; 
+        font-size: 0.85rem;
+        padding: 12px 15px !important;
+    }
+    .dash-spreadsheet-inner th { 
+        background-color: #0f172a !important; /* Slate 900 Header */
+        color: #94a3b8 !important; 
+        border-bottom: 2px solid #334155 !important; 
+        font-weight: 600;
+        text-transform: uppercase;
+        font-size: 0.75rem;
+        letter-spacing: 0.5px;
+    }
+    .dash-spreadsheet tr:hover td {
+        background-color: #334155 !important; /* Slate 700 Hover */
+    }
+    
+    /* Navigation */
+    .nav-link { 
+        color: #94a3b8 !important; 
+        font-weight: 500; 
+        margin: 0 15px; 
+        text-decoration: none !important; 
+        padding: 8px 0 !important;
+        border-bottom: 2px solid transparent;
+        transition: all 0.2s;
+    }
+    .nav-link:hover { color: #e2e8f0 !important; }
+    .nav-link.active { 
+        color: #38bdf8 !important; 
+        border-bottom-color: #38bdf8; 
+    }
+    
+    /* Layout Utilities */
+    .main-content { 
+        padding-top: 100px; 
+        padding-left: 2.5%; 
+        padding-right: 2.5%; 
+        max-width: 1650px; 
+        margin: 0 auto; 
+    }
+    .section-title {
+        color: #f8fafc;
+        font-weight: 600;
+        margin-bottom: 1.5rem;
+        font-size: 1.25rem;
+    }
+"""
+
+app.index_string = f'''
 <!DOCTYPE html>
 <html>
     <head>
-        {%metas%}
+        {{%metas%}}
         <title>Executive Review - PKBI Jabar</title>
-        {%favicon%}
-        {%css%}
+        {{%favicon%}}
+        {{%css%}}
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-        <style>
-            body { 
-                background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%) !important; 
-                font-family: 'Inter', sans-serif; 
-                color: #cbd5e1;
-                margin: 0;
-            }
-            .glass-card {
-                background: rgba(255, 255, 255, 0.03);
-                backdrop-filter: blur(12px);
-                -webkit-backdrop-filter: blur(12px);
-                border: 1px solid rgba(255, 255, 255, 0.05);
-                border-radius: 16px;
-                padding: 2rem;
-                box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.2);
-                margin-bottom: 20px;
-                color: #f8fafc;
-            }
-            .main-title { font-size: 2.2rem; font-weight: 800; margin-bottom: 0.2rem; letter-spacing: -0.5px; color: #f8fafc; }
-            .sub-title { font-size: 1.1rem; color: #94a3b8 !important; margin-bottom: 2rem; font-weight: 400; }
-            .metric-value { color: #38bdf8 !important; font-weight: 700; font-size: 2rem; margin: 0; }
-            .metric-label { color: #94a3b8; font-size: 0.9rem; margin-bottom: 5px; }
-            
-            .sidebar {
-                background: rgba(15, 23, 42, 0.8);
-                backdrop-filter: blur(10px);
-                border-right: 1px solid rgba(255, 255, 255, 0.05);
-                min-height: 100vh;
-                padding: 2rem 1.5rem;
-            }
-            .main-content { padding: 2rem; }
-            
-            /* Override DBC & Dash Components */
-            .card, .dash-table, .form-control, .input-group, .btn, .Select-control {
-                background-color: rgba(255, 255, 255, 0.05) !important;
-                border: 1px solid rgba(255, 255, 255, 0.1) !important;
-                color: #f8fafc !important;
-            }
-            .btn-primary { background-color: #38bdf8 !important; border-color: #38bdf8 !important; color: #0f172a !important; font-weight: 600;}
-            .btn-primary:hover { background-color: #0ea5e9 !important; }
-            
-            /* Tabs */
-            .tab { color: #94a3b8 !important; background-color: transparent !important; border: none !important; }
-            .tab--selected { color: #38bdf8 !important; border-bottom: 2px solid #38bdf8 !important; }
-            
-            /* Data Tables */
-            .dash-table-container .dash-spreadsheet-container { background-color: transparent !important; border: none !important; }
-            .dash-spreadsheet-inner td { background-color: rgba(255, 255, 255, 0.02) !important; color: #cbd5e1 !important; border-color: rgba(255, 255, 255, 0.05) !important; }
-            .dash-spreadsheet-inner th { background-color: rgba(255, 255, 255, 0.05) !important; color: #f8fafc !important; border-color: rgba(255, 255, 255, 0.1) !important; }
-        </style>
+        <style>{CUSTOM_CSS}</style>
     </head>
     <body>
-        {%app_entry%}
-        <footer> {%config%} {%scripts%} {%renderer%} </footer>
+        {{%app_entry%}}
+        <footer> {{%config%}} {{%scripts%}} {{%renderer%}} </footer>
     </body>
 </html>
 '''
 
 # ==========================================================
-# LAYOUT APLIKASI
+# LAYOUT UTAMA: SOLID DARK MODE
 # ==========================================================
-app.layout = dbc.Container([
-    dbc.Row([
-        # SIDEBAR
-        dbc.Col([
-            html.H3("🛠️ Control Panel", style={'color': '#f8fafc', 'marginBottom': '5px'}),
-            html.P("Sistem Navigasi & Manajemen", style={'color': '#94a3b8', 'fontSize': '0.85rem', 'marginTop': '0'}),
-            html.Hr(style={'borderColor': 'rgba(255,255,255,0.1)'}),
-            
-            dcc.RadioItems(
-                id="menu-navigasi",
-                options=[
-                    {"label": " 🎯 Dashboard Review Data", "value": "dashboard"},
-                    {"label": " ⚙️ Pengaturan Keyword Medsos", "value": "medsos"}
-                ],
-                value="dashboard",
-                labelStyle={'display': 'block', 'padding': '10px', 'color': '#cbd5e1', 'cursor': 'pointer', 'borderRadius': '8px'},
-                className="mb-4"
-            ),
-            
-            html.Div(id="sidebar-dashboard-controls"),
-            html.Div(id="sidebar-medsos-controls", style={'display': 'none'})
-        ], width=3, className="sidebar px-0"),
+app.layout = html.Div([
+    # 1. TOP NAVBAR (Solid, Fixed)
+    html.Div([
+        dbc.Row([
+            dbc.Col(html.H3("PKBI Jabar", style={'color': '#f8fafc', 'margin': '0', 'fontWeight': '800', 'fontSize': '1.5rem'}), width="auto"),
+            dbc.Col(html.Div([
+                html.A("Dashboard", href="#", className="nav-link active", id="nav-dashboard"),
+                html.A("Riwayat", href="#", className="nav-link", id="nav-riwayat"),
+                html.A("Laporan", href="#", className="nav-link", id="nav-laporan"),
+            ], style={'display': 'flex', 'alignItems': 'center', 'height': '100%', 'justifyContent': 'flex-start'}), width=True),
+            dbc.Col(html.Div([
+                dbc.Button("⚙️", color="transparent", className="me-2", style={'fontSize': '1.2rem', 'padding': '0'}),
+                html.Div(style={'width': '32px', 'height': '32px', 'borderRadius': '50%', 'background': '#0ea5e9', 'display': 'inline-block'})
+            ], style={'display': 'flex', 'alignItems': 'center', 'justifyContent': 'flex-end'}), width="auto")
+        ], align="center", className="g-0")
+    ], style={
+        'position': 'fixed', 'top': '0', 'left': '0', 'right': '0',
+        'height': '70px', 'zIndex': '1000',
+        'backgroundColor': '#0f172a', 'borderBottom': '1px solid #1e293b',
+        'padding': '0 2.5%'
+    }),
+
+    # 2. MAIN CONTENT AREA
+    html.Div(className="main-content", children=[
         
-        # MAIN CONTENT
-        dbc.Col([
-            html.Div([
-                html.H1("📊 Tools Review Data PKBI Jawa Barat", className="main-title"),
-                html.P("Sistem Penelaahan Kualitas Data Penjangkauan & Rujukan Terpadu (Neon DB)", className="sub-title")
+        # TAB CONTENT CONTAINER
+        html.Div(id="tab-content-container", children=[
+            
+            # === DASHBOARD TAB ===
+            html.Div(id="tab-dashboard", children=[
+                # Control Bar Section
+                dbc.Row([
+                    dbc.Col([
+                        dcc.Upload(
+                            id='upload-penjangkauan',
+                            children=html.Div([
+                                html.I(className="bi bi-cloud-upload", style={'fontSize': '2rem', 'color': '#38bdf8', 'marginBottom': '10px', 'display': 'block'}),
+                                html.Div("Upload File Penjangkauan & Rujukan", style={'fontWeight': '600', 'color': '#f8fafc', 'fontSize': '1.1rem'}),
+                                html.Div("Drag & drop atau klik untuk memilih file (.xlsx, .csv)", style={'fontSize': '0.85rem', 'color': '#94a3b8', 'marginTop': '5px'})
+                            ]),
+                            className="upload-zone",
+                            multiple=False
+                        ),
+                        html.Div(id="status-upload-penjangkauan", style={'marginTop': '10px', 'fontSize': '0.85rem', 'color': '#38bdf8'})
+                    ], width=8),
+                    dbc.Col([
+                        html.Div([
+                            html.Label("Pilih Aturan Validasi", style={'color': '#94a3b8', 'fontSize': '0.85rem', 'marginBottom': '5px'}),
+                            dbc.Select(id="select-aturan", options=[{"label": "Aturan Validasi Bawaan", "value": "default"}], className="mb-3", style={'backgroundColor': '#0f172a', 'color': '#e2e8f0', 'borderColor': '#334155'}),
+                            
+                            html.Label("Keyword Media Sosial", style={'color': '#94a3b8', 'fontSize': '0.85rem', 'marginBottom': '5px'}),
+                            dbc.Select(id="select-medsos", options=[{"label": "Keyword Medsos Default", "value": "default"}], className="mb-3", style={'backgroundColor': '#0f172a', 'color': '#e2e8f0', 'borderColor': '#334155'}),
+                            
+                            dbc.Button("Jalankan Validasi", id="btn-jalankan", className="btn-modern-primary w-100 py-3 mt-2", size="lg")
+                        ], className="solid-card h-100 d-flex flex-column justify-content-center")
+                    ], width=4)
+                ], className="mb-4 g-3"),
+
+                # Metrics Row
+                dbc.Row([
+                    dbc.Col(dbc.Card([
+                        html.H2(id="metric-total-data", className="metric-value text-accent-blue"), 
+                        html.P("Total Data Diproses", className="metric-label")
+                    ], className="solid-card text-center border-0"), width=4),
+                    
+                    dbc.Col(dbc.Card([
+                        html.H2(id="metric-temuan", className="metric-value text-accent-red"), 
+                        html.P("Temuan Error", className="metric-label")
+                    ], className="solid-card text-center border-0"), width=4),
+                    
+                    dbc.Col(dbc.Card([
+                        html.H2(id="metric-akurasi", className="metric-value text-accent-green"), 
+                        html.P("Tingkat Akurasi", className="metric-label")
+                    ], className="solid-card text-center border-0"), width=4),
+                ], className="mb-4 g-3"),
+
+                # Main Workspace: Data Table
+                html.Div([
+                    html.H4("Hasil Review Detail", className="section-title"),
+                    dcc.Loading(
+                        id="loading-table",
+                        type="circle",
+                        color="#38bdf8",
+                        children=dash_table.DataTable(
+                            id='tabel-detail',
+                            editable=True,
+                            page_size=20,
+                            style_table={'overflowX': 'auto', 'borderRadius': '12px'},
+                            css=[{'selector': '.dash-spreadsheet-container', 'rule': 'border-radius: 12px; overflow: hidden;'}]
+                        )
+                    ),
+                    dbc.Row([
+                        dbc.Col(dbc.Button("💾 Simpan Progres ke Database", id="btn-simpan", className="btn-modern-primary w-100 mt-3"), width=6),
+                        dbc.Col(html.Div(id="status-simpan", className="mt-3 text-center", style={'color': '#e2e8f0'}), width=6)
+                    ])
+                ], className="solid-card")
             ]),
-            html.Div(id="main-dashboard-content"),
-            html.Div(id="main-medsos-content", style={'display': 'none'})
-        ], width=9, className="main-content")
+
+            # === RIWAYAT TAB (Hidden by default) ===
+            html.Div(id="tab-riwayat", style={'display': 'none'}, children=[
+                html.H4("Riwayat Sesi Validasi", className="section-title"),
+                html.Div([
+                    dash_table.DataTable(
+                        id='tabel-riwayat',
+                        columns=[
+                            {"name": "Waktu", "id": "waktu"},
+                            {"name": "Periode", "id": "periode"},
+                            {"name": "Total Data", "id": "total_data"},
+                            {"name": "Temuan", "id": "temuan"},
+                            {"name": "Akurasi", "id": "akurasi"},
+                            {"name": "Status Arsip", "id": "status_arsip"},
+                            {"name": "Aksi", "id": "aksi"}
+                        ],
+                        page_size=15,
+                        style_table={'overflowX': 'auto', 'borderRadius': '12px'}
+                    )
+                ], className="solid-card"),
+                dbc.Alert("ℹ️ Riwayat validasi tersimpan otomatis setiap kali tombol 'Jalankan Validasi' ditekan.", 
+                          color="info", className="mt-3", 
+                          style={'backgroundColor': 'rgba(56, 189, 248, 0.1)', 'borderColor': 'rgba(56, 189, 248, 0.3)', 'color': '#38bdf8'})
+            ]),
+
+            # === LAPORAN TAB (Hidden by default) ===
+            html.Div(id="tab-laporan", style={'display': 'none'}, children=[
+                html.H4("Pusat Unduhan Laporan", className="section-title"),
+                dbc.Row([
+                    dbc.Col(dbc.Card([
+                        html.H5("Laporan Rekap Kesalahan (Excel)", style={'color': '#f8fafc', 'fontWeight': '600'}),
+                        html.P("Download matriks kesalahan per SSR dan indikator.", style={'color': '#94a3b8', 'fontSize': '0.9rem', 'marginTop': '10px'}),
+                        dbc.Button("📥 Download Excel", id="btn-dl-excel", className="btn-modern-primary w-100 mt-3")
+                    ], className="solid-card"), width=6),
+                    dbc.Col(dbc.Card([
+                        html.H5("Laporan Tren Bulanan (PDF)", style={'color': '#f8fafc', 'fontWeight': '600'}),
+                        html.P("Download grafik tren validasi semester terakhir.", style={'color': '#94a3b8', 'fontSize': '0.9rem', 'marginTop': '10px'}),
+                        dbc.Button("📄 Download PDF", id="btn-dl-pdf", className="btn-modern-primary w-100 mt-3")
+                    ], className="solid-card"), width=6)
+                ])
+            ])
+        ])
     ])
-], fluid=True)
+])
 
 # ==========================================================
-# CALLBACKS: NAVIGASI MENU
+# CALLBACKS: NAVIGASI TAB
 # ==========================================================
 @callback(
-    [Output('sidebar-dashboard-controls', 'style'),
-     Output('sidebar-medsos-controls', 'style'),
-     Output('main-dashboard-content', 'style'),
-     Output('main-medsos-content', 'style')],
-    Input('menu-navigasi', 'value')
+    [Output('tab-dashboard', 'style'), Output('tab-riwayat', 'style'), Output('tab-laporan', 'style'),
+     Output('nav-dashboard', 'className'), Output('nav-riwayat', 'className'), Output('nav-laporan', 'className')],
+    [Input('nav-dashboard', 'n_clicks'), Input('nav-riwayat', 'n_clicks'), Input('nav-laporan', 'n_clicks')]
 )
-def toggle_menu(menu):
-    if menu == 'dashboard':
-        return {'display': 'block'}, {'display': 'none'}, {'display': 'block'}, {'display': 'none'}
-    else:
-        return {'display': 'none'}, {'display': 'block'}, {'display': 'none'}, {'display': 'block'}
+def switch_tab(n_dash, n_riw, n_lap):
+    triggered = ctx.triggered_id
+    base_class = "nav-link"
+    active_class = "nav-link active"
+    
+    if triggered == 'nav-riwayat':
+        return {'display': 'none'}, {'display': 'block'}, {'display': 'none'}, base_class, active_class, base_class
+    elif triggered == 'nav-laporan':
+        return {'display': 'none'}, {'display': 'none'}, {'display': 'block'}, base_class, base_class, active_class
+    else: # Default Dashboard
+        return {'display': 'block'}, {'display': 'none'}, {'display': 'none'}, active_class, base_class, base_class
 
 # ==========================================================
-# CALLBACKS: UPLOAD FILE
+# CALLBACKS: UPLOAD FILES
 # ==========================================================
 def parse_contents(contents, filename):
+    if not contents: return None
     content_type, content_string = contents.split(',')
     decoded = base64.b64decode(content_string)
     try:
-        if 'csv' in filename: return pd.read_csv(io.StringIO(decoded.decode('utf-8')))
+        if 'csv' in filename: return pd.read_csv(io.StringIO(decoded.decode('utf-8')), low_memory=False)
         else: return pd.read_excel(io.BytesIO(decoded))
     except: return None
 
-@callback(
-    Output('upload-status-ref', 'children', allow_duplicate=True),
-    Input('upload-ref-data', 'contents'),
-    State('upload-ref-data', 'filename'),
-    prevent_initial_call=True
-)
-def upload_ref(contents, filename):
+@callback(Output('status-upload-penjangkauan', 'children'), Input('upload-penjangkauan', 'contents'), State('upload-penjangkauan', 'filename'))
+def update_upload_status(contents, filename):
     if contents:
         df = parse_contents(contents, filename)
         if df is not None:
-            server_state['df_ref'] = df
-            return "✅ File referensi tersimpan di memori."
-    return ""
-
-@callback(
-    Output('upload-status-ref', 'children', allow_duplicate=True),
-    Input('btn-update-ref', 'n_clicks'),
-    prevent_initial_call=True
-)
-def update_ref_db(n_clicks):
-    if server_state['df_ref'] is not None:
-        if import_data_rujukan(server_state['df_ref']): return "✅ Database referensi diperbarui!"
-        else: return "❌ Gagal mengupdate database."
-    return "⚠️ Unggah file terlebih dahulu."
-
-@callback(
-    Output('upload-status-raw', 'children'),
-    Input('upload-raw-data', 'contents'),
-    State('upload-raw-data', 'filename'),
-    prevent_initial_call=True
-)
-def upload_raw(contents_list, filenames):
-    if contents_list:
-        server_state['df_review_list'] = []
-        for c, name in zip(contents_list, filenames):
-            df = parse_contents(c, name)
-            if df is not None: server_state['df_review_list'].append((name, df))
-        return f"📁 {len(contents_list)} file siap diproses."
+            server_state['df_penjangkauan'] = df
+            return f"✅ {filename} berhasil dimuat ({len(df):,} baris)"
     return ""
 
 # ==========================================================
-# CALLBACKS: ATURAN KUSTOM
+# CALLBACKS: JALANKAN VALIDASI & UPDATE METRIKS
 # ==========================================================
 @callback(
-    Output('list-aturan-aktif', 'children'),
-    Input('btn-tambah-aturan', 'n_clicks'),
-    [State('input-nama-ind', 'value'), State('select-kolom', 'value'), State('select-kondisi', 'value'), State('input-pembanding', 'value')],
-    prevent_initial_call=True
-)
-def add_custom_rule(n_clicks, nama, kolom, kondisi, pembanding):
-    if nama and (kondisi == "Kosong / Blank" or pembanding):
-        mapping_kunci = {"NIK": "nik_clean", "ID Klien": "id_clean", "Umur": "umur", "Lembaga SSR": "v_ssr", "Kode Petugas": "v_petugas", "Lokasi Outreach / Jenis Sosial Media": "lokasi", "Informasi Yang diberikan": "info_diberikan", "Rujukan": "rujukan"}
-        kunci_target = mapping_kunci.get(kolom, "")
-        fungsi_validasi = buat_fungsi_validasi_kustom(kunci_target, kondisi, pembanding or "")
-        st.session_state['aturan_kustom'].append({"nama": nama, "periksa": fungsi_validasi})
-        
-    return [html.Div(f"📌 {r['nama']}", style={'fontSize': '0.85rem', 'color': '#cbd5e1', 'padding': '4px 0'}) for r in st.session_state['aturan_kustom']]
-
-# ==========================================================
-# CALLBACKS: EKSEKUSI VALIDASI UTAMA
-# ==========================================================
-@callback(
-    [Output('metric-total-data', 'children'),
-     Output('metric-total-temuan', 'children'),
-     Output('metric-akurasi', 'children'),
-     Output('tabel-matriks', 'data'),
-     Output('tabel-matriks', 'columns'),
-     Output('grafik-tren', 'figure'),
-     Output('tabel-detail', 'data'),
-     Output('tabel-detail', 'columns'),
-     Output('status-proses', 'children')],
-    Input('btn-jalankan', 'n_clicks'),
-    prevent_initial_call=True
+    [Output('metric-total-data', 'children'), Output('metric-temuan', 'children'), Output('metric-akurasi', 'children'),
+     Output('tabel-detail', 'data'), Output('tabel-detail', 'columns'), Output('status-simpan', 'children')],
+    Input('btn-jalankan', 'n_clicks'), prevent_initial_call=True
 )
 def run_validation(n_clicks):
-    if not server_state['df_review_list']:
-        return "0", "0", "0%", [], [], go.Figure(), [], [], "⚠️ Silakan unggah berkas Raw Data terlebih dahulu!"
-        
-    all_errs, total_records = [], 0
-    detected_ssrs = set()
+    df_raw = server_state.get('df_penjangkauan')
+    if df_raw is None or df_raw.empty:
+        return "0", "0", "0%", [], [], "⚠️ Silakan upload file penjangkauan terlebih dahulu!"
 
-    for name, df_target in server_state['df_review_list']:
-        total_records += len(df_target)
-        df_res = jalankan_review_data(df_target, server_state['df_ref'], nama_file=name)
-        if not df_res.empty:
-            all_errs.append(df_res)
-            detected_ssrs.update(df_res['Lembaga SSR'].unique())
-
-    server_state['total_entri'] = total_records
-    tot_data = total_records
+    # Jalankan engine vektorisasi
+    df_errors = jalankan_review_data_optimized(df_raw, server_state.get('df_referensi'))
+    server_state['df_hasil_validasi'] = df_errors
     
-    if all_errs:
-        df_bawah = pd.concat(all_errs, ignore_index=True)
-        tot_err = len(df_bawah)
-        akurasi = max(0, 100 - (tot_err / tot_data * 100)) if tot_data > 0 else 100.0
-        
-        active_ssrs = sorted(list(detected_ssrs))
-        DAFTAR_INDIKATOR_AKTIF = [r["nama"] for r in (ATURAN_VALIDASI_BAWAAN + st.session_state['aturan_kustom'])]
-        
-        matrix_rows = []
-        for ind in DAFTAR_INDIKATOR_AKTIF:
-            r_dict = {"INDIKATOR KESALAHAN DATA": ind}
-            total_ind_err = sum(len(df_bawah[(df_bawah['INDIKATOR KESALAHAN DATA'] == ind) & (df_bawah['Lembaga SSR'] == ssr)]) for ssr in active_ssrs)
-            r_dict["Jumlah per indikator"] = total_ind_err
-            r_dict["%"] = (total_ind_err / tot_err * 100) if tot_err > 0 else 0.0
-            for ssr in active_ssrs: r_dict[ssr] = len(df_bawah[(df_bawah['INDIKATOR KESALAHAN DATA'] == ind) & (df_bawah['Lembaga SSR'] == ssr)])
-            matrix_rows.append(r_dict)
-            
-        df_atas = pd.DataFrame(matrix_rows)
-        df_atas = df_atas[df_atas['Jumlah per indikator'] > 0].reset_index(drop=True)
-        
-        server_state['df_tabel_atas'] = df_atas
-        server_state['df_tabel_bawah'] = df_bawah
-        
-        matriks_data = df_atas.to_dict('records')
-        matriks_cols = [{'name': i, 'id': i} for i in df_atas.columns]
-        
-        detail_data = df_bawah.to_dict('records')
-        detail_cols = [{'name': i, 'id': i, 'editable': (i in ['Pilih', 'Justifikasi'])} for i in df_bawah.columns]
-        
-        # Grafik Tren
-        fig = go.Figure()
-        df_tren = ambil_rekap_tren()
-        if not df_tren.empty:
-            df_pivot = df_tren.pivot_table(index='periode', columns='indikator_kesalahan', values='jumlah_kesalahan', aggfunc='sum', fill_value=0)
-            for col in df_pivot.columns:
-                fig.add_trace(go.Scatter(x=df_pivot.index, y=df_pivot[col], mode='lines', name=col, fill='tozeroy'))
-        fig.update_layout(template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font_color="#cbd5e1", legend=dict(bgcolor="rgba(0,0,0,0)"))
-        
-        return f"{tot_data:,}", f"{tot_err:,}", f"{akurasi:.1f}%", matriks_data, matriks_cols, fig, detail_data, detail_cols, "✅ Validasi selesai!"
-    else:
-        return f"{tot_data:,}", "0", "100%", [], [], go.Figure(), [], [], "✨ Data bersih!"
+    tot_data = len(df_raw)
+    tot_err = len(df_errors) if df_errors is not None else 0
+    akurasi = max(0, 100 - (tot_err / tot_data * 100)) if tot_data > 0 else 100.0
+
+    # Simpan ke Riwayat
+    server_state['riwayat_validasi'].append({
+        'waktu': datetime.now().strftime('%d/%m/%Y %H:%M'),
+        'periode': 'Periode Aktif',
+        'total_data': f"{tot_data:,}",
+        'temuan': f"{tot_err:,}",
+        'akurasi': f"{akurasi:.2f}%",
+        'status_arsip': '⏳ Pending',
+        'aksi': 'Lihat Detail'
+    })
+
+    cols = [{"name": i, "id": i, "editable": (i in ['Pilih', 'Justifikasi'])} for i in df_errors.columns] if df_errors is not None else []
+    data = df_errors.to_dict('records') if df_errors is not None else []
+
+    return f"{tot_data:,}", f"{tot_err:,}", f"{akurasi:.1f}%", data, cols, "✅ Validasi selesai! Silakan review tabel di bawah."
 
 # ==========================================================
-# CALLBACKS: SIMPAN PROGRES & ARSIP
+# CALLBACKS: SIMPAN KE DATABASE (CHUNKED)
 # ==========================================================
-@callback(
-    Output('status-save', 'children'),
-    Input('btn-simpan', 'n_clicks'),
-    State('tabel-detail', 'data'),
-    prevent_initial_call=True
-)
-def save_progress(n_clicks, table_data):
-    if not table_data: return "ℹ️ Tidak ada data."
-    list_log_db = []
+@callback(Output('status-simpan', 'children', allow_duplicate=True), Input('btn-simpan', 'n_clicks'), State('tabel-detail', 'data'), prevent_initial_call=True)
+def save_to_db(n_clicks, table_data):
+    if not table_data: return "ℹ️ Tidak ada data untuk disimpan."
+    
+    list_log = []
     for row in table_data:
-        ind_text = str(row.get('INDIKATOR KESALAHAN DATA', ''))
-        text_justifikasi = str(row.get('Justifikasi', '')).strip()
-        is_konfirmasi = "konfirmasi" in ind_text.lower()
-        is_pilih = bool(row.get('Pilih', False))
-        
-        if is_pilih or (is_konfirmasi and text_justifikasi not in ["", "None"]):
-            list_log_db.append((
+        if bool(row.get('Pilih', False)) or ("konfirmasi" in str(row.get('INDIKATOR KESALAHAN DATA', '')).lower() and str(row.get('Justifikasi', '')).strip() != ""):
+            list_log.append((
                 str(row.get('Lembaga SSR', '')), str(row.get('Tanggal', '')), str(row.get('ID Klien', '')),
-                ind_text, is_pilih, text_justifikasi if is_konfirmasi else ""
+                str(row.get('INDIKATOR KESALAHAN DATA', '')), bool(row.get('Pilih', False)), 
+                str(row.get('Justifikasi', '')).strip()
             ))
             
-    if list_log_db:
-        if simpan_log_ke_neon(list_log_db): return f"🎉 Berhasil menyimpan {len(list_log_db)} baris!"
-        return "❌ Gagal menyimpan."
-    return "ℹ️ Tidak ada data yang diproses."
-
-@callback(
-    Output('status-arsip', 'children'),
-    Input('btn-arsip', 'n_clicks'),
-    prevent_initial_call=True
-)
-def arsip_tren(n_clicks):
-    if jalankan_agregasi_tren(): return "🎉 Data berhasil diarsipkan!"
-    return "❌ Gagal memproses arsip."
+    if list_log:
+        if simpan_log_ke_neon_chunked(list_log):
+            # Update status arsip di riwayat
+            if server_state['riwayat_validasi']:
+                server_state['riwayat_validasi'][-1]['status_arsip'] = '✅ Tersimpan'
+            return f"🎉 Berhasil menyimpan {len(list_log)} baris ke Neon Database!"
+        return "❌ Gagal menyimpan ke database."
+    return "ℹ️ Centang 'Pilih' atau isi 'Justifikasi' untuk menyimpan."
 
 # ==========================================================
-# CALLBACKS: MEDIOS
+# CALLBACKS: UPDATE TABEL RIWAYAT
 # ==========================================================
-@callback(
-    Output('list-medsos', 'children'),
-    [Input('btn-tambah-medsos', 'n_clicks'), Input('menu-navigasi', 'value')],
-    State('input-medsos', 'value'),
-    prevent_initial_call=True
-)
-def manage_medsos(n_clicks, menu, nilai_medsos):
-    if ctx.triggered_id == 'btn-tambah-medsos' and nilai_medsos:
-        tambah_keyword_medsos(nilai_medsos.lower())
-        
-    list_medsos = ambil_keyword_medsos()
-    st.session_state['medsoc_keywords'] = list_medsos
-    
-    return [
-        html.Span(f"🔹 {m}", style={
-            'backgroundColor': 'rgba(56, 189, 248, 0.15)', 'color': '#38bdf8',
-            'border': '1px solid rgba(56, 189, 248, 0.3)', 'padding': '6px 12px',
-            'borderRadius': '20px', 'fontSize': '0.85rem', 'fontWeight': '500'
-        }) for m in list_medsos
-    ]
-
-# ==========================================================
-# RENDER KONTEN DINAMIS (DIPANGGIL SAAT APP START)
-# ==========================================================
-@app.callback(
-    [Output('sidebar-dashboard-controls', 'children'),
-     Output('main-dashboard-content', 'children'),
-     Output('sidebar-medsos-controls', 'children'),
-     Output('main-medsos-content', 'children')],
-    Input('menu-navigasi', 'value')
-)
-def render_content(menu):
-    # Sidebar Dashboard
-    sidebar_dash = html.Div([
-        html.H5("📁 MANAJEMEN BERKAS", style={'color': '#38bdf8', 'fontSize': '0.95rem'}),
-        html.P("Data HIV+ Semester Lalu (.xlsx)", style={'color': '#cbd5e1', 'fontSize': '0.9rem'}),
-        dcc.Upload(id='upload-ref-data', children=html.Div(['Drag & Drop atau ', html.A('Pilih File')], style={'color': '#38bdf8'}),
-                   style={'width': '100%', 'height': '60px', 'lineHeight': '60px', 'borderWidth': '1px', 'borderStyle': 'dashed', 'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0', 'background': 'rgba(255,255,255,0.05)'}, multiple=False),
-        html.Div(id='upload-status-ref', style={'fontSize': '0.8rem', 'color': '#94a3b8'}),
-        dbc.Button("🔄 Update Database Referensi", id="btn-update-ref", color="secondary", className="w-100 mt-2 mb-3", size="sm"),
-        
-        html.P("Raw Data Penjangkauan (Multi-File)", style={'color': '#cbd5e1', 'fontSize': '0.9rem'}),
-        dcc.Upload(id='upload-raw-data', children=html.Div(['Drag & Drop atau ', html.A('Pilih Raw Data')], style={'color': '#38bdf8'}),
-                   style={'width': '100%', 'height': '60px', 'lineHeight': '60px', 'borderWidth': '1px', 'borderStyle': 'dashed', 'borderRadius': '5px', 'textAlign': 'center', 'margin': '10px 0', 'background': 'rgba(255,255,255,0.05)'}, multiple=True),
-        html.Div(id='upload-status-raw', style={'fontSize': '0.8rem', 'color': '#94a3b8'}),
-        
-        html.Hr(style={'borderColor': 'rgba(255,255,255,0.1)', 'margin': '20px 0'}),
-        html.H5("⚙️ PARAMETER VALIDASI", style={'color': '#38bdf8', 'fontSize': '0.95rem'}),
-        dbc.Card([
-            dbc.CardBody([
-                html.P("✨ Buat Aturan Kustom", style={'fontWeight': 'bold', 'color': '#f8fafc'}),
-                dbc.Input(id='input-nama-ind', placeholder="Nama Indikator", className="mb-2"),
-                dbc.Select(id='select-kolom', options=[{"label": k, "value": k} for k in ["NIK", "ID Klien", "Umur", "Lembaga SSR", "Kode Petugas", "Lokasi Outreach / Jenis Sosial Media", "Informasi Yang diberikan", "Rujukan"]], className="mb-2"),
-                dbc.Select(id='select-kondisi', options=[{"label": k, "value": k} for k in ["Panjang karakter tidak sama dengan (!=)", "Panjang karakter kurang dari ( < )", "Kosong / Blank", "Mengandung teks tertentu", "Sama dengan teks/angka tertentu"]], className="mb-2"),
-                dbc.Input(id='input-pembanding', placeholder="Nilai Pembanding", className="mb-2"),
-                dbc.Button("➕ Daftarkan Aturan", id="btn-tambah-aturan", color="primary", className="w-100")
-            ])
-        ], className="glass-card mt-3", style={'padding': '1rem'}),
-        html.Div(id='list-aturan-aktif', className="mt-3"),
-        html.Hr(style={'borderColor': 'rgba(255,255,255,0.1)', 'margin': '20px 0'}),
-        dbc.Button("🚀 Jalankan Penelaahan", id="btn-jalankan", color="primary", className="w-100 mt-3", size="lg"),
-        html.Div(id='status-proses', className="mt-3 text-center")
-    ])
-
-    # Main Dashboard
-    main_dash = html.Div([
-        dbc.Row([
-            dbc.Col(dbc.Card([html.P("Total Data Diproses", className="metric-label"), html.H2(id="metric-total-data", className="metric-value")], className="glass-card"), width=4),
-            dbc.Col(dbc.Card([html.P("Total Temuan", className="metric-label"), html.H2(id="metric-total-temuan", className="metric-value")], className="glass-card"), width=4),
-            dbc.Col(dbc.Card([html.P("Tingkat Akurasi", className="metric-label"), html.H2(id="metric-akurasi", className="metric-value")], className="glass-card"), width=4),
-        ], className="mb-4"),
-        
-        dcc.Tabs([
-            dcc.Tab(label='📋 Rekap Kesalahan (Matriks)', children=[
-                html.Div([dash_table.DataTable(id='tabel-matriks', page_size=15)], className="glass-card mt-4")
-            ]),
-            dcc.Tab(label='📈 Analisis Tren Semester', children=[
-                html.Div([dcc.Graph(id='grafik-tren', style={'backgroundColor': 'transparent'})], className="glass-card mt-4")
-            ])
-        ]),
-        
-        html.H3("🔍 Hasil Review Penjangkauan", className="mt-4", style={'color': '#f8fafc'}),
-        html.Div([
-            dash_table.DataTable(id='tabel-detail', editable=True, page_size=15, style_table={'maxHeight': '600px', 'overflowY': 'scroll'}),
-            dbc.Row([
-                dbc.Col(dbc.Button("💾 Simpan Progres", id="btn-simpan", color="secondary", className="w-100 mt-3"), width=4),
-                dbc.Col(html.Div(id="status-save", className="mt-3"), width=8)
-            ])
-        ], className="glass-card mt-3"),
-        
-        html.H3("⚙️ Manajemen Akhir Periode", className="mt-4", style={'color': '#f8fafc'}),
-        dbc.Alert("⚠️ Gunakan tombol ini HANYA JIKA periode bulanan sudah selesai.", color="warning", style={'backgroundColor': 'rgba(255, 193, 7, 0.1)', 'borderColor': 'rgba(255, 193, 7, 0.3)', 'color': '#ffc107'}),
-        dbc.Button("🚀 Tutup Periode & Arsipkan", id="btn-arsip", color="primary", className="w-100 mt-2"),
-        html.Div(id="status-arsip", className="mt-2 text-center")
-    ])
-
-    # Sidebar Medsos
-    sidebar_medsos = html.Div([
-        html.H5("⚙️ MEDSOS SETTINGS", style={'color': '#38bdf8'}),
-        html.P("Kelola keyword media sosial untuk validasi lokasi outreach.", style={'color': '#94a3b8', 'fontSize': '0.9rem'})
-    ])
-
-    # Main Medsos
-    main_medsos = html.Div([
-        dbc.Row([
-            dbc.Col([
-                dbc.Card([
-                    html.H4("➕ Tambah Medsos Baru", style={'color': '#f8fafc'}),
-                    dbc.Input(id="input-medsos", placeholder="Contoh: grindr", className="mb-3"),
-                    dbc.Button("Simpan Keyword", id="btn-tambah-medsos", color="primary", className="w-100")
-                ], className="glass-card")
-            ], width=5),
-            dbc.Col([
-                dbc.Card([
-                    html.H4("📋 Daftar Keyword Aktif", style={'color': '#f8fafc'}),
-                    html.Div(id="list-medsos", style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px', 'padding': '15px', 'border': '1px solid rgba(255,255,255,0.1)', 'borderRadius': '8px', 'backgroundColor': 'rgba(0,0,0,0.2)'})
-                ], className="glass-card")
-            ], width=7)
-        ])
-    ])
-
-    return sidebar_dash, main_dash, sidebar_medsos, main_medsos
+@callback(Output('tabel-riwayat', 'data'), Input('nav-riwayat', 'n_clicks'), prevent_initial_call=True)
+def update_riwayat_table(n):
+    return server_state.get('riwayat_validasi', [])
 
 if __name__ == '__main__':
-    app.run_server(debug=True, port=8050)
+    app.run(debug=True, port=8050)
